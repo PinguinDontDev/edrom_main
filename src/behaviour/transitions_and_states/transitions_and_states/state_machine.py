@@ -26,19 +26,12 @@ class StateMachine:
         self.march_duration = 1.0
         self.idle_duration = 1.5
 
-        # Controle interno do ciclo de visão
-        self.vision_phase = 'searching_ball'
-        self.vision_phase_start = time.time()
-        self.tracking_duration = 2.0      # Tempo em focado na bola (s)
-        self.field_search_duration = 5.0  # Tempo em 'searc varrendo o campo antes de voltar a focar na bola (s)
-
-        # Flags internas
+        # Flags internas (privadas)
         self._walking_condition = False
         self._getting_up_condition = False
         self._kick_condition = False
         self._kick_done_condition = False
         self._aligning_condition = False
-        self._search_condition = False
         self._impossible_condition = False
 
         self.state_msg = CurrentStateMsg()
@@ -57,38 +50,6 @@ class StateMachine:
             self.gc_state = 'PLAYING'
             self.gc_penalty = 0
 
-    def update_vision_cycle(self, ball_found):
-        """
-        Ciclo interno:
-        searching_ball ('searching') -> achou bola -> tracking ('tracking')
-        -> passou tracking_duration -> searching_field ('searching')
-        -> passou field_search_duration -> searching_ball ('searching')
-        """
-        now = time.time()
-
-        # Congela o cronômetro se o robô não estiver executando busca/foco
-        if self.state not in ('searching', 'tracking'):
-            self.vision_phase_start = now
-            return
-
-        if self.vision_phase == 'searching_ball':
-            if ball_found:
-                self.vision_phase = 'tracking'
-                self.vision_phase_start = now
-
-        elif self.vision_phase == 'tracking':
-            if not ball_found:
-                self.vision_phase = 'searching_ball'
-                self.vision_phase_start = now
-            elif (now - self.vision_phase_start) >= self.tracking_duration:
-                self.vision_phase = 'searching_field'
-                self.vision_phase_start = now
-
-        elif self.vision_phase == 'searching_field':
-            if (now - self.vision_phase_start) >= self.field_search_duration:
-                self.vision_phase = 'searching_ball'
-                self.vision_phase_start = now
-
     def request_state_machine_update(self, ball_position, ball_close, ball_found, fall_state,
                                      hor_motor_out_of_center, head_kick_check, kick_done,
                                      gc_connected=False, gc_state='PLAYING', gc_penalty=0,
@@ -96,14 +57,12 @@ class StateMachine:
         """
         Atualiza as condições da máquina de estados e retorna o estado atual.
         """
-        self.search_condition_update(ball_found)
         self.getting_up_condition_update(fall_state)
         self.walking_condition_update(ball_found, ball_close)
         self.kick_condition_update(head_kick_check, ball_close, hor_motor_out_of_center)
         self.kick_done_condition_update(kick_done)
         self.aligning_condition_update(hor_motor_out_of_center)
         self.update_game_controller(gc_connected, gc_state, gc_penalty, gc_player_found)
-        self.update_vision_cycle(ball_found)
 
         self.update_state()
 
@@ -131,8 +90,6 @@ class StateMachine:
         class PRIORITY:
             GETTING_UP = 100
             KICK_IN_PROGRESS = 95
-            TRACKING = 93
-            SEARCHING = 90
             STABILIZATION = 85
             ALIGNING = 80
             KICKING = 75
@@ -153,21 +110,18 @@ class StateMachine:
         if self._kick_done_condition:
             control_list.append(('kicking', PRIORITY.KICK_IN_PROGRESS))
 
-        # Saída da visão: apenas 'tracking' ou 'searching'
-        if self.vision_phase == 'tracking':
-            control_list.append(('tracking', PRIORITY.TRACKING))
-        else:
-            control_list.append(('searching', PRIORITY.SEARCHING))
-
         if self.state == 'getting_up' and not self._getting_up_condition:
             control_list.append(('idle_march', PRIORITY.POST_GETTING_UP))
 
+        # Conferindo se está alinhado
         if self._aligning_condition:
             control_list.append(('aligning', PRIORITY.ALIGNING))
 
+        # Caso possa chutar, chuta
         if self._kick_condition:
             control_list.append(('kicking', PRIORITY.KICKING))
 
+        # Movimento (único estado de caminhada, substituindo qualquer search)
         if self._walking_condition:
             control_list.append(('walking', PRIORITY.WALKING))
 
@@ -177,12 +131,9 @@ class StateMachine:
         # Mapeamento do que é permitido executar em cada estado do jogo
         allowed_behaviors = {
             'INITIAL': ['getting_up', 'idle'],
-            'READY': ['getting_up', 'idle', 'searching', 'tracking', 'walking', 'aligning'],
+            'READY': ['getting_up', 'idle', 'walking', 'aligning'],
             'SET': ['getting_up', 'idle'],
-            'PLAYING': [
-                'getting_up', 'idle_march', 'idle', 'searching',
-                'tracking', 'aligning', 'walking', 'kicking'
-            ],
+            'PLAYING': ['getting_up', 'idle_march', 'idle', 'aligning', 'walking', 'kicking'],
             'FINISHED': ['getting_up', 'idle'],
             'PENALIZED': ['getting_up', 'idle']
         }
@@ -199,7 +150,7 @@ class StateMachine:
             filtered_list.append(('idle', PRIORITY.IDLE))
         print(filtered_list)
 
-        # SELECIONANDO MAIOR PRIORIDADE DA LISTA (versão original)
+        # Seleciona a maior prioridade da lista filtrada
         max_val = -1
         novo_estado = self.state
 
@@ -211,9 +162,6 @@ class StateMachine:
         self.change_state(novo_estado)
 
     # ----- FUNÇÕES UPDATE CONDITION -----
-    def search_condition_update(self, ball_found):
-        self._search_condition = not ball_found
-
     def getting_up_condition_update(self, fall_state):
         self._getting_up_condition = (fall_state != UP)
 
@@ -221,7 +169,8 @@ class StateMachine:
         self._kick_done_condition = kick_done
 
     def walking_condition_update(self, ball_found, ball_close):
-        self._walking_condition = (ball_found and not ball_close)
+        # Anda sempre que a bola não estiver encontrada E próxima o suficiente para parar/chutar
+        self._walking_condition = not (ball_found and ball_close)
 
     def kick_condition_update(self, head_kick_check, ball_close, hor_motor_out_of_center):
         self._kick_condition = (head_kick_check and ball_close and hor_motor_out_of_center == CENTER)
@@ -230,9 +179,6 @@ class StateMachine:
         self._aligning_condition = (hor_motor_out_of_center != CENTER)
 
     # ----- FUNÇÕES RETURN CONDITION -----
-    def search_condition(self):
-        return self._search_condition
-
     def walking_condition(self):
         return self._walking_condition
 
@@ -250,4 +196,3 @@ class StateMachine:
 
     def impossible_condition(self):
         return self._impossible_condition
-
