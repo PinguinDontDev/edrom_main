@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-#coding=utf-8
-'''
-Verificar a adição do game controller e funcionamento no ros2
-'''
+# coding=utf-8
+"""
+Verificar a adição do game controller e funcionamento no ROS 2.
+"""
 
 import time
 from modularized_bhv_msgs.msg import CurrentStateMsg
@@ -12,20 +12,27 @@ LEFT = 'Left'
 RIGHT = 'Right'
 UP = 'Up'
 
+
 class StateMachine:
 
     def __init__(self):
         """
-        Construtor da máquina de estados (Refatorada para Utility AI via Lista)
+        Construtor da máquina de estados (Utility AI via Lista).
         """
         self.state = 'idle_march'
         self.enter_time = time.time()
 
-        # Variáveis nativas do código original para tempo de estabilização
+        # Tempos de estabilização
         self.march_duration = 1.0
         self.idle_duration = 1.5
 
-        # flags internas (privadas)
+        # Controle do ciclo contínuo: bola -> foco -> referências -> bola
+        self.vision_phase = 'searching_ball'
+        self.vision_phase_start = time.time()
+        self.tracking_duration = 2.0   # Tempo focado na bola após achá-la (segundos)
+        self.flags_duration = 5.0      # Tempo buscando referências antes de voltar para a bola (segundos)
+
+        # Flags internas
         self._walking_condition = False
         self._getting_up_condition = False
         self._kick_condition = False
@@ -43,24 +50,48 @@ class StateMachine:
         """Atualiza as condições com valores recebidos pelo ROS, sem JSON."""
         if connected:
             self.gc_state = state
-            # Não confunde ausência do jogador com penalidade zero nem mantém
-            # uma penalidade antiga quando a configuração do jogo muda.
             self.gc_penalty = penalty if player_found else 0
             if not player_found:
                 self.gc_state = 'INITIAL'
         else:
-            # Em caso de perda de comunicação, assume comportamento normal para não travar em campo
             self.gc_state = 'PLAYING'
             self.gc_penalty = 0
+
+    def update_vision_cycle(self, ball_found):
+        """
+        Gerencia o ciclo contínuo usando relógio (sem threading.Timer):
+        searching_ball -> (achou bola) -> tracking_ball -> (passou tempo) -> searching_flags -> (passou tempo) -> searching_ball
+        """
+        now = time.time()
+
+        if self.vision_phase == 'searching_ball':
+            if ball_found:
+                self.vision_phase = 'tracking_ball'
+                self.vision_phase_start = now
+
+        elif self.vision_phase == 'tracking_ball':
+            if not ball_found:
+                # Perdeu a bola enquanto tentava focar: volta a procurar
+                self.vision_phase = 'searching_ball'
+                self.vision_phase_start = now
+            elif (now - self.vision_phase_start) >= self.tracking_duration:
+                # Já focou tempo suficiente na bola: vai buscar referências no campo
+                self.vision_phase = 'searching_flags'
+                self.vision_phase_start = now
+
+        elif self.vision_phase == 'searching_flags':
+            if (now - self.vision_phase_start) >= self.flags_duration:
+                # Passou o tempo buscando referências: volta a procurar/focar a bola
+                self.vision_phase = 'searching_ball'
+                self.vision_phase_start = now
 
     def request_state_machine_update(self, ball_position, ball_close, ball_found, fall_state,
                                      hor_motor_out_of_center, head_kick_check, kick_done,
                                      gc_connected=False, gc_state='PLAYING', gc_penalty=0,
                                      gc_player_found=False):
         """
-        Atualiza as condições da máquina de estados e retorna o estado atual
+        Atualiza as condições da máquina de estados e retorna o estado atual.
         """
-        # Atualiza flags de condição originais
         self.search_condition_update(ball_found)
         self.getting_up_condition_update(fall_state)
         self.walking_condition_update(ball_found, ball_close)
@@ -68,10 +99,11 @@ class StateMachine:
         self.kick_done_condition_update(kick_done)
         self.aligning_condition_update(hor_motor_out_of_center)
         self.update_game_controller(gc_connected, gc_state, gc_penalty, gc_player_found)
+        self.update_vision_cycle(ball_found)
 
         self.update_state()
 
-        print(f'-------------------\nEstado {self.state}')
+        print(f'-------------------\nEstado: {self.state}')
         self.state_msg.current_state = str(self.state)
         return self.state_msg
 
@@ -92,87 +124,86 @@ class StateMachine:
         """
         control_list = []
 
-        # prioridades
         class PRIORITY:
             GETTING_UP = 100
             KICK_IN_PROGRESS = 95
-            SEARCHING = 90
+            TRACKING_BALL = 93
+            SEARCHING_BALL = 92
+            SEARCHING_FLAGS = 90
             STABILIZATION = 85
-            ALINGNING = 80
+            ALIGNING = 80
             KICKING = 75
             WALKING = 60
             POST_GETTING_UP = 40
             IDLE = 0
 
-        # Tempo de marcha
+        # Tempo de marcha / estabilização
         if self.state == 'idle_march' and (time.time() - self.enter_time) < self.march_duration:
             control_list.append(('idle_march', PRIORITY.STABILIZATION))
         elif self.state == 'idle' and (time.time() - self.enter_time) < self.idle_duration:
             control_list.append(('idle', PRIORITY.STABILIZATION))
 
-        # Primeiro definindo os estados de maior prioridade
+        # Estados de maior prioridade
         if self._getting_up_condition:
             control_list.append(('getting_up', PRIORITY.GETTING_UP))
 
         if self._kick_done_condition:
             control_list.append(('kicking', PRIORITY.KICK_IN_PROGRESS))
 
-        if self._search_condition:
-            control_list.append(('searching', PRIORITY.SEARCHING))
+        # Ciclo de busca da bola -> tracking -> busca de referências
+        if self.vision_phase == 'tracking_ball':
+            control_list.append(('tracking_ball', PRIORITY.TRACKING_BALL))
+        elif self.vision_phase == 'searching_ball':
+            control_list.append(('searching_ball', PRIORITY.SEARCHING_BALL))
+        elif self.vision_phase == 'searching_flags':
+            control_list.append(('searching_flags', PRIORITY.SEARCHING_FLAGS))
 
         if self.state == 'getting_up' and not self._getting_up_condition:
             control_list.append(('idle_march', PRIORITY.POST_GETTING_UP))
 
-        # Conferindo se estou alinhado
         if self._aligning_condition:
-            control_list.append(('aligning', PRIORITY.ALINGNING))
+            control_list.append(('aligning', PRIORITY.ALIGNING))
 
-        # Caso eu possa chutar, chute
         if self._kick_condition:
             control_list.append(('kicking', PRIORITY.KICKING))
 
-        # Movimento
         if self._walking_condition:
             control_list.append(('walking', PRIORITY.WALKING))
 
-        # Novo fallback rígido e seguro
+        # Fallback seguro
         control_list.append(('idle', PRIORITY.IDLE))
 
-        # Mapeamento do que é permitido executar em cada estado do jogo
+        # Estados permitidos por fase do GameController (incluindo os novos estados de busca/tracking)
         allowed_behaviors = {
             'INITIAL': ['getting_up', 'idle'],
-            'READY': ['getting_up', 'idle', 'searching', 'walking', 'aligning'],
+            'READY': [
+                'getting_up', 'idle', 'searching_ball', 'tracking_ball',
+                'searching_flags', 'walking', 'aligning'
+            ],
             'SET': ['getting_up', 'idle'],
-            'PLAYING': ['getting_up', 'idle_march', 'idle', 'searching', 'aligning', 'walking', 'kicking'],
+            'PLAYING': [
+                'getting_up', 'idle_march', 'idle', 'searching_ball',
+                'tracking_ball', 'searching_flags', 'aligning', 'walking', 'kicking'
+            ],
             'FINISHED': ['getting_up', 'idle'],
             'PENALIZED': ['getting_up', 'idle']
         }
 
-        # Penalte -> Oq a gente faz quando ta no penalte???
         current_gc_state = self.gc_state
         if self.gc_penalty != 0:
             current_gc_state = 'PENALIZED'
         print(current_gc_state)
-        # Extrai quais estados a máquina pode assumir agora
+
         valid_states = allowed_behaviors.get(current_gc_state, ['getting_up', 'idle'])
-        
-        # Filtra a lista de controle mantendo apenas os estados permitidos no momento do jogo
         filtered_list = [(estado, prio) for estado, prio in control_list if estado in valid_states]
 
         if not filtered_list:
             filtered_list.append(('idle', PRIORITY.IDLE))
         print(filtered_list)
-        # SELECIONANDO MAIOR PRIORIDADE DA LISTA
-        max_val = -1
-        novo_estado = self.state
 
-        for estado, prioridade in filtered_list:
-            if prioridade > max_val:
-                max_val = prioridade
-                novo_estado = estado
-
+        # Seleciona a maior prioridade da lista filtrada
+        novo_estado, _ = max(filtered_list, key=lambda item: item[1])
         self.change_state(novo_estado)
-
 
     # ----- FUNÇÕES UPDATE CONDITION -----
     def search_condition_update(self, ball_found):
@@ -193,7 +224,7 @@ class StateMachine:
     def aligning_condition_update(self, hor_motor_out_of_center):
         self._aligning_condition = (hor_motor_out_of_center != CENTER)
 
-    # ----- FUNÇÕES RETURN CONDITION-----
+    # ----- FUNÇÕES RETURN CONDITION -----
     def search_condition(self):
         return self._search_condition
 
