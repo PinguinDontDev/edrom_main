@@ -26,11 +26,11 @@ class StateMachine:
         self.march_duration = 1.0
         self.idle_duration = 1.5
 
-        # Controle do ciclo contínuo: bola -> foco -> referências -> bola
+        # Controle interno do ciclo de visão
         self.vision_phase = 'searching_ball'
         self.vision_phase_start = time.time()
-        self.tracking_duration = 2.0   # Tempo focado na bola após achá-la (segundos)
-        self.flags_duration = 5.0      # Tempo buscando referências antes de voltar para a bola (segundos)
+        self.tracking_duration = 2.0      # Tempo em focado na bola (s)
+        self.field_search_duration = 5.0  # Tempo em 'searc varrendo o campo antes de voltar a focar na bola (s)
 
         # Flags internas
         self._walking_condition = False
@@ -59,29 +59,33 @@ class StateMachine:
 
     def update_vision_cycle(self, ball_found):
         """
-        Gerencia o ciclo contínuo usando relógio (sem threading.Timer):
-        searching_ball -> (achou bola) -> tracking_ball -> (passou tempo) -> searching_flags -> (passou tempo) -> searching_ball
+        Ciclo interno:
+        searching_ball ('searching') -> achou bola -> tracking ('tracking')
+        -> passou tracking_duration -> searching_field ('searching')
+        -> passou field_search_duration -> searching_ball ('searching')
         """
         now = time.time()
 
+        # Congela o cronômetro se o robô não estiver executando busca/foco
+        if self.state not in ('searching', 'tracking'):
+            self.vision_phase_start = now
+            return
+
         if self.vision_phase == 'searching_ball':
             if ball_found:
-                self.vision_phase = 'tracking_ball'
+                self.vision_phase = 'tracking'
                 self.vision_phase_start = now
 
-        elif self.vision_phase == 'tracking_ball':
+        elif self.vision_phase == 'tracking':
             if not ball_found:
-                # Perdeu a bola enquanto tentava focar: volta a procurar
                 self.vision_phase = 'searching_ball'
                 self.vision_phase_start = now
             elif (now - self.vision_phase_start) >= self.tracking_duration:
-                # Já focou tempo suficiente na bola: vai buscar referências no campo
-                self.vision_phase = 'searching_flags'
+                self.vision_phase = 'searching_field'
                 self.vision_phase_start = now
 
-        elif self.vision_phase == 'searching_flags':
-            if (now - self.vision_phase_start) >= self.flags_duration:
-                # Passou o tempo buscando referências: volta a procurar/focar a bola
+        elif self.vision_phase == 'searching_field':
+            if (now - self.vision_phase_start) >= self.field_search_duration:
                 self.vision_phase = 'searching_ball'
                 self.vision_phase_start = now
 
@@ -103,7 +107,7 @@ class StateMachine:
 
         self.update_state()
 
-        print(f'-------------------\nEstado: {self.state}')
+        print(f'-------------------\nEstado {self.state}')
         self.state_msg.current_state = str(self.state)
         return self.state_msg
 
@@ -127,9 +131,8 @@ class StateMachine:
         class PRIORITY:
             GETTING_UP = 100
             KICK_IN_PROGRESS = 95
-            TRACKING_BALL = 93
-            SEARCHING_BALL = 92
-            SEARCHING_FLAGS = 90
+            TRACKING = 93
+            SEARCHING = 90
             STABILIZATION = 85
             ALIGNING = 80
             KICKING = 75
@@ -150,13 +153,11 @@ class StateMachine:
         if self._kick_done_condition:
             control_list.append(('kicking', PRIORITY.KICK_IN_PROGRESS))
 
-        # Ciclo de busca da bola -> tracking -> busca de referências
-        if self.vision_phase == 'tracking_ball':
-            control_list.append(('tracking_ball', PRIORITY.TRACKING_BALL))
-        elif self.vision_phase == 'searching_ball':
-            control_list.append(('searching_ball', PRIORITY.SEARCHING_BALL))
-        elif self.vision_phase == 'searching_flags':
-            control_list.append(('searching_flags', PRIORITY.SEARCHING_FLAGS))
+        # Saída da visão: apenas 'tracking' ou 'searching'
+        if self.vision_phase == 'tracking':
+            control_list.append(('tracking', PRIORITY.TRACKING))
+        else:
+            control_list.append(('searching', PRIORITY.SEARCHING))
 
         if self.state == 'getting_up' and not self._getting_up_condition:
             control_list.append(('idle_march', PRIORITY.POST_GETTING_UP))
@@ -170,20 +171,17 @@ class StateMachine:
         if self._walking_condition:
             control_list.append(('walking', PRIORITY.WALKING))
 
-        # Fallback seguro
+        # Fallback rígido e seguro
         control_list.append(('idle', PRIORITY.IDLE))
 
-        # Estados permitidos por fase do GameController (incluindo os novos estados de busca/tracking)
+        # Mapeamento do que é permitido executar em cada estado do jogo
         allowed_behaviors = {
             'INITIAL': ['getting_up', 'idle'],
-            'READY': [
-                'getting_up', 'idle', 'searching_ball', 'tracking_ball',
-                'searching_flags', 'walking', 'aligning'
-            ],
+            'READY': ['getting_up', 'idle', 'searching', 'tracking', 'walking', 'aligning'],
             'SET': ['getting_up', 'idle'],
             'PLAYING': [
-                'getting_up', 'idle_march', 'idle', 'searching_ball',
-                'tracking_ball', 'searching_flags', 'aligning', 'walking', 'kicking'
+                'getting_up', 'idle_march', 'idle', 'searching',
+                'tracking', 'aligning', 'walking', 'kicking'
             ],
             'FINISHED': ['getting_up', 'idle'],
             'PENALIZED': ['getting_up', 'idle']
@@ -201,8 +199,15 @@ class StateMachine:
             filtered_list.append(('idle', PRIORITY.IDLE))
         print(filtered_list)
 
-        # Seleciona a maior prioridade da lista filtrada
-        novo_estado, _ = max(filtered_list, key=lambda item: item[1])
+        # SELECIONANDO MAIOR PRIORIDADE DA LISTA (versão original)
+        max_val = -1
+        novo_estado = self.state
+
+        for estado, prioridade in filtered_list:
+            if prioridade > max_val:
+                max_val = prioridade
+                novo_estado = estado
+
         self.change_state(novo_estado)
 
     # ----- FUNÇÕES UPDATE CONDITION -----
@@ -245,3 +250,4 @@ class StateMachine:
 
     def impossible_condition(self):
         return self._impossible_condition
+
