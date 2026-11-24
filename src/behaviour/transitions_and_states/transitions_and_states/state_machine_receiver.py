@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#coding=utf-8
-'''
-Node que recebe variáveis da máquina de estados e sinal de término de chute,
-atualiza a StateMachine e publica o estado atual no tópico correspondente.
-'''
+# coding=utf-8
+"""
+Node que recebe variáveis da máquina de estados, sinal de término de chute
+e dados do GameController, reduzindo o GC para 3 estados: PLAY, STOP ou PENALIZED.
+"""
 
 import rclpy
 from rclpy.node import Node
@@ -16,24 +16,24 @@ from .behaviour_parameters import BehaviourParameters
 class StateMachineReceiver(Node):
 
     def __init__(self):
-        """
-        Construtor:
-        - Inicializa o objeto responsável pelas transições
-        - Cria subscribers para as variáveis de comportamento e para o status do chute
-        - Publica o estado atual da máquina
-        """
         super().__init__('state_machine_receiver')
 
         self.parameters = BehaviourParameters()
         self.state_machine = StateMachine()
 
-        # Inicializa variáveis internas
+        # Variáveis internas
         self.last_state_machine_msg = None
         self.kick_done = False
+
+        # Dados brutos do GameController
         self.gc_connected = False
         self.gc_state = 'PLAYING'
         self.gc_penalty = 0
         self.gc_player_found = False
+        self.gc_stopped = False
+
+        # Manda para a maquina de estadados apenas 'PLAY', 'STOP' ou 'PENALIZED'
+        self.treated_gc_state = 'PLAY'
 
         # Publisher do estado atual
         self.state_publisher = self.create_publisher(
@@ -44,41 +44,65 @@ class StateMachineReceiver(Node):
         self.create_subscription(
             StateMachineMsg, self.parameters.stateMachineTopic, self.state_machine_callback, 10
         )
-
         self.create_subscription(
-            Bool, "/kick_done", self.kick_done_callback, 10
+            Bool, '/kick_done', self.kick_done_callback, 10
         )
-        self.create_subscription(GameControllerMsg, '/gc/state', self.game_controller_callback, 10)
+        self.create_subscription(
+            GameControllerMsg, '/gc/state', self.game_controller_callback, 10
+        )
 
-        self.get_logger().info("StateMachineReceiver iniciado e aguardando mensagens...")
-        # O ros_packer só publica quando alguma variável muda. Sem este timer,
-        # estados temporizados (idle_march/idle) nunca expirariam sozinhos.
+        self.get_logger().info('StateMachineReceiver iniciado e aguardando mensagens...')
         self.create_timer(0.1, self.update_state)  # 10 Hz
 
+    def treat_game_controller(self) -> str:
+        """Converte todos os dados do GameController em apenas 3 estados: PLAY, STOP ou PENALIZED."""
+        # Sem conexão com o GC -> continua jogando (regra 4.4 b)
+        if not self.gc_connected:
+            return 'PLAY'
 
-    def game_controller_callback(self, msg):
+        # Jogador não encontrado na lista do time -> para por segurança
+        if not self.gc_player_found:
+            return 'STOP'
+
+        # Penalizado -> congelamento total (sem andar, levantar ou mexer a cabeça)
+        if self.gc_penalty != 0:
+            return 'PENALIZED'
+
+        # Jogo pausado pelo árbitro (stopped) ou qualquer estado diferente de PLAYING
+        if self.gc_stopped or self.gc_state != 'PLAYING':
+            return 'STOP'
+
+        return 'PLAY'
+
+    def game_controller_callback(self, msg: GameControllerMsg):
         self.gc_connected = msg.connected
         self.gc_state = msg.state
         self.gc_penalty = msg.penalty
         self.gc_player_found = msg.player_found
+        self.gc_stopped = bool(getattr(msg, 'stopped', False))
 
-    # Recebe mensagem principal da máquina (com variáveis de percepção e estado)
-    def state_machine_callback(self, msg):
+        new_treated = self.treat_game_controller()
+        if new_treated != self.treated_gc_state:
+            self.get_logger().info(f'GC tratado: {self.treated_gc_state} -> {new_treated}')
+            self.treated_gc_state = new_treated
+
+        self.update_state()
+
+    def state_machine_callback(self, msg: StateMachineMsg):
         self.last_state_machine_msg = msg
         self.update_state()
 
-    # Recebe flag indicando se o chute terminou
-    def kick_done_callback(self, msg):
+    def kick_done_callback(self, msg: Bool):
         self.kick_done = msg.data
 
     def update_state(self):
-        # Só processa se já recebeu a mensagem principal
         if self.last_state_machine_msg is None:
             return
 
         stateMachineVars = self.last_state_machine_msg
+        self.treated_gc_state = self.treat_game_controller()
 
-        # Atualiza a máquina de estados com todos os dados
+        # Envia apenas o estado já tratado ('PLAY', 'STOP' ou 'PENALIZED')
         state_msg = self.state_machine.request_state_machine_update(
             stateMachineVars.ball_position,
             stateMachineVars.ball_close,
@@ -87,23 +111,24 @@ class StateMachineReceiver(Node):
             stateMachineVars.hor_motor_out_of_center,
             stateMachineVars.head_kick_check,
             self.kick_done,
-            gc_connected=self.gc_connected,
-            gc_state=self.gc_state,
-            gc_penalty=self.gc_penalty,
-            gc_player_found=self.gc_player_found,
+            gc_state=self.treated_gc_state,
         )
 
-        # Publica o estado atual
         self.state_publisher.publish(state_msg)
-        self.get_logger().debug(f"Estado publicado: {state_msg.current_state}")
+        self.get_logger().debug(f'Estado publicado: {state_msg.current_state}')
 
 
 def main(args=None):
     rclpy.init(args=args)
     receiver = StateMachineReceiver()
-    rclpy.spin(receiver)
-    receiver.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(receiver)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        receiver.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
