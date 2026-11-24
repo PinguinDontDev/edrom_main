@@ -1,16 +1,52 @@
-# gc_receiver_node.py
-import json, socket, threading
+	#!/usr/bin/env python3
+# coding=utf-8
+"""
+Game controller ROS 2 - New 2026 atualizado sem virus confiavel top re top double top ultra new
+"""
+
+import json
+import socket
+import struct
+import threading
+import time
+
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String, UInt8, Int32, Int16
+from std_msgs.msg import Bool, Int16, Int32, String, UInt8
+
 from robocup_game_control_data import (
-    GAMECONTROLLER_DATA_PORT, RoboCupGameControlData
+    GAMECONTROLLER_DATA_PORT,
+    RoboCupGameControlData,
 )
+
+# Constantes oficiais do RoboCupGameControlData.h
+GAMECONTROLLER_RETURN_PORT = 3939
+GAMECONTROLLER_RETURN_STRUCT_HEADER = b'RGrt'
+GAMECONTROLLER_RETURN_STRUCT_VERSION = 2
+GAMECONTROLLER_RETURN_MSG_ALIVE = 2
+
+STATE_MAP = {
+    0: 'INITIAL',
+    1: 'READY',
+    2: 'SET',
+    3: 'PLAYING',
+    4: 'FINISHED',
+}
+
 
 class GCReceiver(Node):
     def __init__(self):
         super().__init__('gc_receiver')
-        # Publicadores principais
+
+        # Parâmetros de identificação do robô (máx. 4 jogadores por time na HSL)
+        self.team_number = int(self.declare_parameter('team_number', 1).value)
+        self.player_number = int(self.declare_parameter('player_number', 1).value)  # 1..4
+        self.gc_timeout = float(self.declare_parameter('gc_timeout', 3.0).value)    # GC envia 2 Hz
+        self.return_port = int(self.declare_parameter('return_port', GAMECONTROLLER_RETURN_PORT).value)
+        self.send_return = bool(self.declare_parameter('send_return_packet', True).value)
+        self.has_localization = bool(self.declare_parameter('has_localization', False).value)
+
+        # Publicadores originais (mantidos para compatibilidade)
         self.pub_raw = self.create_publisher(String, '/gc/raw', 10)
         self.pub_state = self.create_publisher(UInt8, '/gc/state', 10)
         self.pub_phase = self.create_publisher(UInt8, '/gc/game_phase', 10)
@@ -18,61 +54,244 @@ class GCReceiver(Node):
         self.pub_team0_score = self.create_publisher(Int32, '/gc/team0/score', 10)
         self.pub_team1_score = self.create_publisher(Int32, '/gc/team1/score', 10)
 
-        # Socket UDP broadcast 3838
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # compatível com TCM rodando
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.bind(('', GAMECONTROLLER_DATA_PORT))
+        # Novos publicadores para a StateMachine (regra 4.4 e seção 6)
+        self.pub_connected = self.create_publisher(Bool, '/gc/connected', 10)
+        self.pub_state_name = self.create_publisher(String, '/gc/state_name', 10)
+        self.pub_penalty = self.create_publisher(UInt8, '/gc/penalty', 10)
+        self.pub_player_found = self.create_publisher(Bool, '/gc/player_found', 10)
+        self.pub_kickoff_wait = self.create_publisher(Bool, '/gc/kickoff_wait', 10)
+        self.pub_can_move = self.create_publisher(Bool, '/gc/can_move', 10)
 
-        self.get_logger().info('GCReceiver escutando UDP 3838...')
+        # Controle interno de conexão e retorno unicast
+        self._lock = threading.Lock()
+        self.last_packet_time = 0.0
+        self.gc_ip = None
+        self.connected = False
+
+        # Socket UDP de recepção (broadcast porta 3838) com timeout para shutdown limpo
+        self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.recv_sock.settimeout(1.0)
+        self.recv_sock.bind(('', GAMECONTROLLER_DATA_PORT))
+
+        # Socket UDP separado para envio UNICAST direto ao PC do GC (regra 4.4 u)
+        self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+
+        self.get_logger().info(
+            f'GCReceiver escutando UDP {GAMECONTROLLER_DATA_PORT} '
+            f'(Team={self.team_number}, Player={self.player_number}, '
+            f'ReturnPort={self.return_port}, Localizacao={self.has_localization})'
+        )
+
+        # Watchdog de conexão (regra 4.4 b: continuar jogando se o Wi-Fi cair)
+        self.watchdog_timer = self.create_timer(0.5, self._watchdog_callback)
+
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
+
+    def _build_return_packet(self) -> bytes:
+        """
+        Monta o pacote oficial RoboCupGameControlReturnData (Humanoid League):
+        char header[4] = "RGrt", uint8 version = 2, uint8 team, uint8 player, uint8 message = ALIVE (2).
+        Não requer posição/localização no campo.
+        """
+        return struct.pack(
+            '<4sBBBB',
+            GAMECONTROLLER_RETURN_STRUCT_HEADER,
+            GAMECONTROLLER_RETURN_STRUCT_VERSION,
+            self.team_number & 0xFF,
+            self.player_number & 0xFF,
+            GAMECONTROLLER_RETURN_MSG_ALIVE,
+        )
+
+    def _send_alive_to_gc(self, gc_ip: str):
+        """Envia pacote de status diretamente (unicast) ao IP do PC do GameController."""
+        if not self.send_return or not gc_ip:
+            return
+        try:
+            packet = self._build_return_packet()
+            self.send_sock.sendto(packet, (gc_ip, self.return_port))
+        except OSError as exc:
+            self.get_logger().warn(
+                f'Falha enviando retorno unicast ao GC ({gc_ip}:{self.return_port}): {exc}',
+                throttle_duration_sec=2.0,
+            )
+
+    def _extract_my_status(self, parsed):
+        """Localiza meu time, o time adversário e a penalidade individual deste robô."""
+        my_team = None
+        opponent_team_number = None
+
+        for team in parsed.teams:
+            t_num = int(team.teamNumber)
+            if t_num == self.team_number:
+                my_team = team
+            else:
+                opponent_team_number = t_num
+
+        if my_team is None:
+            return False, False, 0, 0, opponent_team_number
+
+        players = getattr(my_team, 'players', None)
+        idx = self.player_number - 1
+        if players is None or not (0 <= idx < len(players)):
+            return True, False, 0, 0, opponent_team_number
+
+        me = players[idx]
+        penalty = int(getattr(me, 'penalty', 0))
+        secs_unpenalised = int(getattr(me, 'secsTillUnpenalised', 0))
+        return True, True, penalty, secs_unpenalised, opponent_team_number
+
+    def _watchdog_callback(self):
+        """
+        Regra 4.4(b): se a rede cair por mais de gc_timeout segundos,
+        sinaliza desconexão e libera fallback para o robô continuar jogando.
+        """
+        with self._lock:
+            elapsed = time.monotonic() - self.last_packet_time
+            is_disconnected = (self.last_packet_time == 0.0) or (elapsed > self.gc_timeout)
+
+            if is_disconnected and self.connected:
+                self.connected = False
+                self.get_logger().warn(
+                    f'Sem pacotes do GameController há {elapsed:.1f}s. '
+                    'Ativando fallback (regra 4.4 b: robô continua jogando).'
+                )
+
+        if is_disconnected:
+            self.pub_connected.publish(Bool(data=False))
+            self.pub_player_found.publish(Bool(data=False))
+            self.pub_penalty.publish(UInt8(data=0))
+            self.pub_kickoff_wait.publish(Bool(data=False))
+            self.pub_state_name.publish(String(data='PLAYING'))
+            self.pub_can_move.publish(Bool(data=True))
 
     def _loop(self):
         while rclpy.ok():
             try:
-                data, addr = self.sock.recvfrom(2048)
-                parsed = RoboCupGameControlData.parse(data)
+                data, addr = self.recv_sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
 
-                # JSON fácil de debugar
+            try:
+                parsed = RoboCupGameControlData.parse(data)
+                gc_ip = addr[0]
+
+                with self._lock:
+                    self.last_packet_time = time.monotonic()
+                    self.gc_ip = gc_ip
+                    self.connected = True
+
+                # Regra 4.4(r) e 4.4(u): responde em unicast na taxa do GC (~2 Hz)
+                self._send_alive_to_gc(gc_ip)
+
+                raw_state = int(parsed.state)
+                state_name = STATE_MAP.get(raw_state, 'INITIAL')
+                game_phase = int(getattr(parsed, 'gamePhase', getattr(parsed, 'secondaryState', 0)))
+                set_play = int(getattr(parsed, 'setPlay', 0))
+                kicking_team = int(getattr(parsed, 'kickingTeam', 0))
+                secondary_time = int(getattr(parsed, 'secondaryTime', 0))
+
+                team_found, player_found, my_penalty, secs_unpenalised, opp_team = self._extract_my_status(parsed)
+
+                # Sem localização: aguarda os 10s do kick-off adversário (regras 5.3 e 6.3 g/i)
+                kickoff_wait = (
+                    state_name == 'PLAYING'
+                    and my_penalty == 0
+                    and opp_team is not None
+                    and kicking_team == opp_team
+                    and secondary_time > 0
+                )
+
+                # Determina o estado efetivo para a máquina de estados do robô
+                if not player_found:
+                    effective_state = 'INITIAL'
+                elif my_penalty != 0:
+                    effective_state = 'PENALIZED'
+                elif kickoff_wait:
+                    # Trava como SET até acabar os 10s do kick-off adversário
+                    effective_state = 'SET'
+                else:
+                    effective_state = state_name
+
+                # Sem localização: só libera movimentação de jogo no PLAYING válido
+                # (no READY o robô é posicionado manualmente pelo handler - seção 6)
+                can_move = (effective_state == 'PLAYING')
+
                 msg = {
-                    'from': addr[0],
-                    'state': int(parsed.state),
-                    'gamePhase': int(parsed.gamePhase),
-                    'setPlay': int(parsed.setPlay),
+                    'from': gc_ip,
+                    'connected': True,
+                    'state': raw_state,
+                    'stateName': state_name,
+                    'effectiveState': effective_state,
+                    'gamePhase': game_phase,
+                    'setPlay': set_play,
                     'firstHalf': int(parsed.firstHalf),
-                    'kickingTeam': int(parsed.kickingTeam),
+                    'kickingTeam': kicking_team,
                     'secsRemaining': int(parsed.secsRemaining),
-                    'secondaryTime': int(parsed.secondaryTime),
-                    'teams': []
+                    'secondaryTime': secondary_time,
+                    'myTeamFound': team_found,
+                    'playerFound': player_found,
+                    'myPenalty': my_penalty,
+                    'secsTillUnpenalised': secs_unpenalised,
+                    'kickoffWait': kickoff_wait,
+                    'canMove': can_move,
+                    'teams': [],
                 }
-                for ti in range(2):
-                    team = parsed.teams[ti]
+                for team in parsed.teams:
                     msg['teams'].append({
                         'teamNumber': int(team.teamNumber),
                         'score': int(team.score),
-                        'goalkeeper': int(team.goalkeeper),
-                        'messageBudget': int(team.messageBudget)
+                        'goalkeeper': int(getattr(team, 'goalkeeper', 0)),
+                        'messageBudget': int(getattr(team, 'messageBudget', 0)),
                     })
 
+                # Publicações originais
                 self.pub_raw.publish(String(data=json.dumps(msg)))
-                self.pub_state.publish(UInt8(data=int(parsed.state)))
-                self.pub_phase.publish(UInt8(data=int(parsed.gamePhase)))
+                self.pub_state.publish(UInt8(data=raw_state))
+                self.pub_phase.publish(UInt8(data=game_phase))
                 self.pub_secs_remaining.publish(Int16(data=int(parsed.secsRemaining)))
                 self.pub_team0_score.publish(Int32(data=int(parsed.teams[0].score)))
                 self.pub_team1_score.publish(Int32(data=int(parsed.teams[1].score)))
-            except Exception as e:
-                self.get_logger().warn(f'Erro recebendo/parsing GC: {e}')
 
-def main():
-    rclpy.init()
+                # Publicações novas para controle de jogo
+                self.pub_connected.publish(Bool(data=True))
+                self.pub_player_found.publish(Bool(data=player_found))
+                self.pub_penalty.publish(UInt8(data=my_penalty))
+                self.pub_kickoff_wait.publish(Bool(data=kickoff_wait))
+                self.pub_state_name.publish(String(data=effective_state))
+                self.pub_can_move.publish(Bool(data=can_move))
+
+            except Exception as exc:
+                self.get_logger().warn(f'Erro recebendo/parsing GC: {exc}', throttle_duration_sec=2.0)
+
+    def destroy_node(self):
+        try:
+            self.recv_sock.close()
+        except OSError:
+            pass
+        try:
+            self.send_sock.close()
+        except OSError:
+            pass
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
     node = GCReceiver()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
