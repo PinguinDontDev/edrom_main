@@ -40,7 +40,7 @@ class StateMachine:
         self.gc_penalty = 0
 
     def update_game_controller(self, connected, state, penalty, player_found):
-        """Atualiza as condições com valores recebidos pelo ROS, sem JSON."""
+        """Atualiza as condições com valores recebidos pelo ROS, sem JSON.
         if connected:
             self.gc_state = state
             self.gc_penalty = penalty if player_found else 0
@@ -48,7 +48,10 @@ class StateMachine:
                 self.gc_state = 'INITIAL'
         else:
             self.gc_state = 'PLAYING'
-            self.gc_penalty = 0
+            self.gc_penalty = 0"""
+            #quanfor aplicar o game controller mexer aqui
+		self.gc_state = 'PLAYING'
+		self.gc_penalty = 0
 
     def request_state_machine_update(self, ball_position, ball_close, ball_found, fall_state,
                                      hor_motor_out_of_center, head_kick_check, kick_done,
