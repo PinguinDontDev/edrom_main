@@ -122,7 +122,7 @@ class WorldSubscriber(Node):
         pts = []
         for r in msg.robots:
             rx, ry = r.bb.center.position.x, r.bb.center.position.y
-            # Ignora detecções em cima do próprio robô para não travar o HybridPlanner
+            #sem olhar pontos em cima do robo
             if valid_xy(rx, ry) and math.hypot(rx, ry) > self.min_self_dist:
                 pts.append(to_field(pose, rx, ry))
         self.robots = (time.monotonic(), pts)
@@ -151,7 +151,7 @@ class WorldSubscriber(Node):
         now = time.monotonic()
         ball = self.ball[1] if self.ball and (now - self.ball[0]) < self.ball_ttl else None
 
-        # Sem bola válida: não publica destino falso (permite entrar em modo SEARCH)
+        # Sem bola válida: não publica destino falso
         if ball is None:
             return
 
