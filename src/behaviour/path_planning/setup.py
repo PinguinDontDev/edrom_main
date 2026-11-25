@@ -20,7 +20,8 @@ setup(
     entry_points={
         'console_scripts': [
             'trajectory_planner = path_planning.trajectory_planner:main',
-            'simulated_path_planning = simulated_path_planning.simulated_path_planning:main'
+            'simulated_path_planning = simulated_path_planning.simulated_path_planning:main',
+            'world_subscriber = path_planning.world_subscriber:main',
         ],
     },
 )
